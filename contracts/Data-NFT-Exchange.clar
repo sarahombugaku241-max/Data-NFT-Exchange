@@ -73,6 +73,38 @@
     }
 )
 
+(define-map usage-analytics
+    uint
+    {
+        total-views: uint,
+        total-licenses: uint,
+        total-revenue: uint,
+        last-accessed: uint,
+        unique-viewers: uint,
+        trending-score: uint
+    }
+)
+
+(define-map user-activity
+    {token-id: uint, user: principal}
+    {
+        view-count: uint,
+        last-viewed: uint,
+        total-spent: uint,
+        interaction-type: (string-ascii 16)
+    }
+)
+
+(define-map daily-stats
+    {token-id: uint, day: uint}
+    {
+        views: uint,
+        licenses: uint,
+        revenue: uint,
+        unique-users: uint
+    }
+)
+
 (define-public (mint-data-nft 
     (name (string-ascii 64))
     (description (string-ascii 256))
@@ -97,6 +129,14 @@
             royalty-percent: royalty-percent,
             base-price: base-price,
             verification-status: false
+        })
+        (map-set usage-analytics token-id {
+            total-views: u0,
+            total-licenses: u0,
+            total-revenue: u0,
+            last-accessed: stacks-block-height,
+            unique-viewers: u0,
+            trending-score: u0
         })
         (var-set next-token-id (+ token-id u1))
         (ok token-id)
@@ -177,6 +217,27 @@
             (royalty-amount (/ (* license-price (get royalty-percent metadata)) u100))
             (owner-amount (- license-price royalty-amount))
             (owner (unwrap! (nft-get-owner? data-nft token-id) ERR-NOT-FOUND))
+            (current-analytics (default-to {
+                total-views: u0,
+                total-licenses: u0,
+                total-revenue: u0,
+                last-accessed: u0,
+                unique-viewers: u0,
+                trending-score: u0
+            } (map-get? usage-analytics token-id)))
+            (current-user-activity (default-to {
+                view-count: u0,
+                last-viewed: u0,
+                total-spent: u0,
+                interaction-type: ""
+            } (map-get? user-activity {token-id: token-id, user: tx-sender})))
+            (current-day (/ stacks-block-height u144))
+            (daily-data (default-to {
+                views: u0,
+                licenses: u0,
+                revenue: u0,
+                unique-users: u0
+            } (map-get? daily-stats {token-id: token-id, day: current-day})))
         )
         (asserts! (>= (stx-get-balance tx-sender) license-price) ERR-INSUFFICIENT-BALANCE)
         (asserts! (get verification-status metadata) ERR-ACCESS-DENIED)
@@ -193,6 +254,22 @@
         })
         (map-set royalty-earnings (get creator metadata) 
             (+ (default-to u0 (map-get? royalty-earnings (get creator metadata))) royalty-amount))
+        
+        (map-set usage-analytics token-id (merge current-analytics {
+            total-licenses: (+ (get total-licenses current-analytics) u1),
+            total-revenue: (+ (get total-revenue current-analytics) license-price),
+            last-accessed: stacks-block-height,
+            trending-score: (+ (get trending-score current-analytics) u10)
+        }))
+        (map-set user-activity {token-id: token-id, user: tx-sender} (merge current-user-activity {
+            total-spent: (+ (get total-spent current-user-activity) license-price),
+            last-viewed: stacks-block-height,
+            interaction-type: "license"
+        }))
+        (map-set daily-stats {token-id: token-id, day: current-day} (merge daily-data {
+            licenses: (+ (get licenses daily-data) u1),
+            revenue: (+ (get revenue daily-data) license-price)
+        }))
         (ok expires-at)
     )
 )
@@ -232,6 +309,54 @@
         (asserts! (is-eq owner tx-sender) ERR-NOT-AUTHORIZED)
         (asserts! (> new-price u0) ERR-INVALID-PRICE)
         (map-set data-metadata token-id (merge metadata {base-price: new-price}))
+        (ok true)
+    )
+)
+
+(define-public (track-data-view (token-id uint))
+    (let 
+        (
+            (metadata (unwrap! (map-get? data-metadata token-id) ERR-NOT-FOUND))
+            (current-analytics (default-to {
+                total-views: u0,
+                total-licenses: u0,
+                total-revenue: u0,
+                last-accessed: u0,
+                unique-viewers: u0,
+                trending-score: u0
+            } (map-get? usage-analytics token-id)))
+            (current-user-activity (map-get? user-activity {token-id: token-id, user: tx-sender}))
+            (is-new-viewer (is-none current-user-activity))
+            (current-day (/ stacks-block-height u144))
+            (daily-data (default-to {
+                views: u0,
+                licenses: u0,
+                revenue: u0,
+                unique-users: u0
+            } (map-get? daily-stats {token-id: token-id, day: current-day})))
+        )
+        (map-set usage-analytics token-id (merge current-analytics {
+            total-views: (+ (get total-views current-analytics) u1),
+            last-accessed: stacks-block-height,
+            unique-viewers: (+ (get unique-viewers current-analytics) (if is-new-viewer u1 u0)),
+            trending-score: (+ (get trending-score current-analytics) u1)
+        }))
+        (map-set user-activity {token-id: token-id, user: tx-sender} {
+            view-count: (+ (match current-user-activity
+                activity (get view-count activity)
+                u0
+            ) u1),
+            last-viewed: stacks-block-height,
+            total-spent: (match current-user-activity
+                activity (get total-spent activity)
+                u0
+            ),
+            interaction-type: "view"
+        })
+        (map-set daily-stats {token-id: token-id, day: current-day} (merge daily-data {
+            views: (+ (get views daily-data) u1),
+            unique-users: (+ (get unique-users daily-data) (if is-new-viewer u1 u0))
+        }))
         (ok true)
     )
 )
@@ -293,4 +418,61 @@
 
 (define-read-only (get-token-uri (token-id uint))
     (ok (some "https://datanft.exchange/metadata/"))
+)
+
+(define-read-only (get-usage-analytics (token-id uint))
+    (map-get? usage-analytics token-id)
+)
+
+(define-read-only (get-user-activity (token-id uint) (user principal))
+    (map-get? user-activity {token-id: token-id, user: user})
+)
+
+(define-read-only (get-daily-stats (token-id uint) (day uint))
+    (map-get? daily-stats {token-id: token-id, day: day})
+)
+
+(define-read-only (get-trending-score (token-id uint))
+    (match (map-get? usage-analytics token-id)
+        analytics (get trending-score analytics)
+        u0
+    )
+)
+
+(define-read-only (calculate-engagement-rate (token-id uint))
+    (match (map-get? usage-analytics token-id)
+        analytics (let 
+            (
+                (views (get total-views analytics))
+                (licenses (get total-licenses analytics))
+            )
+            (if (> views u0)
+                (/ (* licenses u100) views)
+                u0
+            )
+        )
+        u0
+    )
+)
+
+(define-read-only (get-revenue-per-view (token-id uint))
+    (match (map-get? usage-analytics token-id)
+        analytics (let 
+            (
+                (revenue (get total-revenue analytics))
+                (views (get total-views analytics))
+            )
+            (if (> views u0)
+                (/ revenue views)
+                u0
+            )
+        )
+        u0
+    )
+)
+
+(define-read-only (is-trending (token-id uint))
+    (let ((score (get-trending-score token-id)))
+        (> score u50)
+    )
 )
