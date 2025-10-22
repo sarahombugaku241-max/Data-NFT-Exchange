@@ -8,9 +8,14 @@
 (define-constant ERR-INVALID-ROYALTY (err u403))
 (define-constant ERR-LICENSE-EXPIRED (err u410))
 (define-constant ERR-ACCESS-DENIED (err u403))
+(define-constant ERR-PRICING-DISABLED (err u411))
 
 (define-data-var next-token-id uint u1)
 (define-data-var contract-owner principal tx-sender)
+(define-data-var dynamic-pricing-enabled bool true)
+(define-data-var base-multiplier uint u100)
+(define-data-var trending-threshold uint u50)
+(define-data-var max-price-multiplier uint u300)
 
 (define-map data-metadata 
     uint 
@@ -105,6 +110,27 @@
     }
 )
 
+(define-map dynamic-pricing
+    uint
+    {
+        current-multiplier: uint,
+        last-updated: uint,
+        demand-score: uint,
+        price-adjustment-count: uint,
+        peak-multiplier: uint
+    }
+)
+
+(define-map pricing-history
+    {token-id: uint, period: uint}
+    {
+        avg-multiplier: uint,
+        total-adjustments: uint,
+        period-start: uint,
+        period-end: uint
+    }
+)
+
 (define-public (mint-data-nft 
     (name (string-ascii 64))
     (description (string-ascii 256))
@@ -137,6 +163,13 @@
             last-accessed: stacks-block-height,
             unique-viewers: u0,
             trending-score: u0
+        })
+        (map-set dynamic-pricing token-id {
+            current-multiplier: (var-get base-multiplier),
+            last-updated: stacks-block-height,
+            demand-score: u0,
+            price-adjustment-count: u0,
+            peak-multiplier: (var-get base-multiplier)
         })
         (var-set next-token-id (+ token-id u1))
         (ok token-id)
@@ -212,7 +245,9 @@
     (let 
         (
             (metadata (unwrap! (map-get? data-metadata token-id) ERR-NOT-FOUND))
-            (license-price (get base-price metadata))
+            (license-price (if (var-get dynamic-pricing-enabled) 
+                (get-dynamic-price token-id) 
+                (get base-price metadata)))
             (expires-at (+ stacks-block-height duration-blocks))
             (royalty-amount (/ (* license-price (get royalty-percent metadata)) u100))
             (owner-amount (- license-price royalty-amount))
@@ -270,6 +305,10 @@
             licenses: (+ (get licenses daily-data) u1),
             revenue: (+ (get revenue daily-data) license-price)
         }))
+        (if (var-get dynamic-pricing-enabled)
+            (update-dynamic-pricing token-id)
+            u0
+        )
         (ok expires-at)
     )
 )
@@ -357,6 +396,10 @@
             views: (+ (get views daily-data) u1),
             unique-users: (+ (get unique-users daily-data) (if is-new-viewer u1 u0))
         }))
+        (if (var-get dynamic-pricing-enabled)
+            (update-dynamic-pricing token-id)
+            u0
+        )
         (ok true)
     )
 )
@@ -475,4 +518,154 @@
     (let ((score (get-trending-score token-id)))
         (> score u50)
     )
+)
+
+(define-private (calculate-demand-score (token-id uint))
+    (match (map-get? usage-analytics token-id)
+        analytics (let
+            (
+                (views (get total-views analytics))
+                (licenses (get total-licenses analytics))
+                (trending-score (get trending-score analytics))
+                (engagement-rate (calculate-engagement-rate token-id))
+            )
+            (+ 
+                (/ views u10)
+                (* licenses u15)
+                (/ trending-score u5)
+                (/ engagement-rate u2)
+            )
+        )
+        u0
+    )
+)
+
+(define-private (calculate-price-multiplier (token-id uint))
+    (if (var-get dynamic-pricing-enabled)
+        (let
+            (
+                (demand-score (calculate-demand-score token-id))
+                (is-trending-token (is-trending token-id))
+                (base-mult (var-get base-multiplier))
+                (max-mult (var-get max-price-multiplier))
+            )
+            (let
+                (
+                    (demand-multiplier (+ base-mult (/ demand-score u2)))
+                    (trending-bonus (if is-trending-token u50 u0))
+                    (total-multiplier (+ demand-multiplier trending-bonus))
+                )
+                (if (> total-multiplier max-mult) max-mult total-multiplier)
+            )
+        )
+        (var-get base-multiplier)
+    )
+)
+
+(define-private (update-dynamic-pricing (token-id uint))
+    (let
+        (
+            (current-pricing (default-to {
+                current-multiplier: (var-get base-multiplier),
+                last-updated: u0,
+                demand-score: u0,
+                price-adjustment-count: u0,
+                peak-multiplier: (var-get base-multiplier)
+            } (map-get? dynamic-pricing token-id)))
+            (new-multiplier (calculate-price-multiplier token-id))
+            (new-demand-score (calculate-demand-score token-id))
+            (is-adjustment (not (is-eq new-multiplier (get current-multiplier current-pricing))))
+            (new-peak (if (> new-multiplier (get peak-multiplier current-pricing)) 
+                new-multiplier (get peak-multiplier current-pricing)))
+        )
+        (map-set dynamic-pricing token-id {
+            current-multiplier: new-multiplier,
+            last-updated: stacks-block-height,
+            demand-score: new-demand-score,
+            price-adjustment-count: (+ (get price-adjustment-count current-pricing) 
+                (if is-adjustment u1 u0)),
+            peak-multiplier: new-peak
+        })
+        new-multiplier
+    )
+)
+
+(define-read-only (get-dynamic-price (token-id uint))
+    (match (map-get? data-metadata token-id)
+        metadata (let
+            (
+                (base-price (get base-price metadata))
+                (multiplier (calculate-price-multiplier token-id))
+            )
+            (/ (* base-price multiplier) u100)
+        )
+        u0
+    )
+)
+
+(define-read-only (get-dynamic-pricing-info (token-id uint))
+    (map-get? dynamic-pricing token-id)
+)
+
+(define-read-only (get-pricing-history (token-id uint) (period uint))
+    (map-get? pricing-history {token-id: token-id, period: period})
+)
+
+(define-public (toggle-dynamic-pricing)
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (var-set dynamic-pricing-enabled (not (var-get dynamic-pricing-enabled)))
+        (ok (var-get dynamic-pricing-enabled))
+    )
+)
+
+(define-public (update-pricing-parameters (new-base-multiplier uint) (new-max-multiplier uint) (new-trending-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (and (>= new-base-multiplier u50) (<= new-base-multiplier u200)) ERR-INVALID-PRICE)
+        (asserts! (and (>= new-max-multiplier u200) (<= new-max-multiplier u500)) ERR-INVALID-PRICE)
+        (asserts! (and (>= new-trending-threshold u20) (<= new-trending-threshold u100)) ERR-INVALID-PRICE)
+        (var-set base-multiplier new-base-multiplier)
+        (var-set max-price-multiplier new-max-multiplier)
+        (var-set trending-threshold new-trending-threshold)
+        (ok true)
+    )
+)
+
+(define-public (record-pricing-period (token-id uint) (period uint))
+    (let
+        (
+            (current-pricing (unwrap! (map-get? dynamic-pricing token-id) ERR-NOT-FOUND))
+            (period-start (* period u1000))
+            (period-end (+ period-start u999))
+        )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (map-set pricing-history {token-id: token-id, period: period} {
+            avg-multiplier: (get current-multiplier current-pricing),
+            total-adjustments: (get price-adjustment-count current-pricing),
+            period-start: period-start,
+            period-end: period-end
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (is-dynamic-pricing-enabled)
+    (var-get dynamic-pricing-enabled)
+)
+
+(define-read-only (get-pricing-parameters)
+    {
+        base-multiplier: (var-get base-multiplier),
+        max-multiplier: (var-get max-price-multiplier),
+        trending-threshold: (var-get trending-threshold)
+    }
+)
+
+(define-read-only (get-demand-score (token-id uint))
+    (calculate-demand-score token-id)
+)
+
+(define-read-only (get-price-multiplier (token-id uint))
+    (calculate-price-multiplier token-id)
 )
