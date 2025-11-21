@@ -669,3 +669,233 @@
 (define-read-only (get-price-multiplier (token-id uint))
     (calculate-price-multiplier token-id)
 )
+
+(define-map batch-operations
+    {operator: principal, batch-id: uint}
+    {
+        operation-type: (string-ascii 32),
+        total-items: uint,
+        completed-items: uint,
+        started-at: uint,
+        completed-at: uint,
+        total-cost: uint,
+        status: (string-ascii 16)
+    }
+)
+
+(define-data-var next-batch-id uint u1)
+
+(define-public (batch-mint-data-nfts (items (list 10 {
+    name: (string-ascii 64),
+    description: (string-ascii 256),
+    data-hash: (buff 32),
+    category: (string-ascii 32),
+    size-bytes: uint,
+    royalty-percent: uint,
+    base-price: uint
+})))
+    (let
+        (
+            (batch-id (var-get next-batch-id))
+            (total-count (len items))
+        )
+        (var-set next-batch-id (+ batch-id u1))
+        (map-set batch-operations {operator: tx-sender, batch-id: batch-id} {
+            operation-type: "batch-mint",
+            total-items: total-count,
+            completed-items: u0,
+            started-at: stacks-block-height,
+            completed-at: u0,
+            total-cost: u0,
+            status: "processing"
+        })
+        (let
+            (
+                (result (fold batch-mint-helper items (ok (list))))
+            )
+            (map-set batch-operations {operator: tx-sender, batch-id: batch-id} {
+                operation-type: "batch-mint",
+                total-items: total-count,
+                completed-items: total-count,
+                started-at: stacks-block-height,
+                completed-at: stacks-block-height,
+                total-cost: u0,
+                status: "completed"
+            })
+            result
+        )
+    )
+)
+
+(define-private (batch-mint-helper (item {
+    name: (string-ascii 64),
+    description: (string-ascii 256),
+    data-hash: (buff 32),
+    category: (string-ascii 32),
+    size-bytes: uint,
+    royalty-percent: uint,
+    base-price: uint
+}) (acc (response (list 10 uint) uint)))
+    (match acc
+        success-list
+            (let ((token-id (var-get next-token-id)))
+                (match (mint-data-nft
+                    (get name item)
+                    (get description item)
+                    (get data-hash item)
+                    (get category item)
+                    (get size-bytes item)
+                    (get royalty-percent item)
+                    (get base-price item)
+                )
+                    minted-id (ok (unwrap-panic (as-max-len? (append success-list minted-id) u10)))
+                    err-val (err err-val)
+                )
+            )
+        err-val (err err-val)
+    )
+)
+
+(define-public (batch-license-data (licenses (list 10 {
+    token-id: uint,
+    license-type: (string-ascii 32),
+    duration-blocks: uint,
+    usage-rights: (string-ascii 128)
+})))
+    (let
+        (
+            (batch-id (var-get next-batch-id))
+            (total-count (len licenses))
+        )
+        (var-set next-batch-id (+ batch-id u1))
+        (map-set batch-operations {operator: tx-sender, batch-id: batch-id} {
+            operation-type: "batch-license",
+            total-items: total-count,
+            completed-items: u0,
+            started-at: stacks-block-height,
+            completed-at: u0,
+            total-cost: u0,
+            status: "processing"
+        })
+        (let
+            (
+                (result (fold batch-license-helper licenses (ok (list))))
+                (total-cost (fold calculate-license-cost licenses u0))
+            )
+            (map-set batch-operations {operator: tx-sender, batch-id: batch-id} {
+                operation-type: "batch-license",
+                total-items: total-count,
+                completed-items: total-count,
+                started-at: stacks-block-height,
+                completed-at: stacks-block-height,
+                total-cost: total-cost,
+                status: "completed"
+            })
+            result
+        )
+    )
+)
+
+(define-private (batch-license-helper (item {
+    token-id: uint,
+    license-type: (string-ascii 32),
+    duration-blocks: uint,
+    usage-rights: (string-ascii 128)
+}) (acc (response (list 10 uint) uint)))
+    (match acc
+        success-list
+            (match (license-data
+                (get token-id item)
+                (get license-type item)
+                (get duration-blocks item)
+                (get usage-rights item)
+            )
+                expires-at (ok (unwrap-panic (as-max-len? (append success-list expires-at) u10)))
+                err-val (err err-val)
+            )
+        err-val (err err-val)
+    )
+)
+
+(define-private (calculate-license-cost (item {
+    token-id: uint,
+    license-type: (string-ascii 32),
+    duration-blocks: uint,
+    usage-rights: (string-ascii 128)
+}) (acc uint))
+    (+ acc (if (var-get dynamic-pricing-enabled)
+        (get-dynamic-price (get token-id item))
+        (match (map-get? data-metadata (get token-id item))
+            metadata (get base-price metadata)
+            u0
+        )
+    ))
+)
+
+(define-public (batch-grant-access (grants (list 10 {
+    token-id: uint,
+    accessor: principal,
+    permission-type: (string-ascii 32),
+    duration-blocks: uint
+})))
+    (let
+        (
+            (batch-id (var-get next-batch-id))
+            (total-count (len grants))
+        )
+        (var-set next-batch-id (+ batch-id u1))
+        (map-set batch-operations {operator: tx-sender, batch-id: batch-id} {
+            operation-type: "batch-grant",
+            total-items: total-count,
+            completed-items: u0,
+            started-at: stacks-block-height,
+            completed-at: u0,
+            total-cost: u0,
+            status: "processing"
+        })
+        (let
+            (
+                (result (fold batch-grant-helper grants (ok (list))))
+            )
+            (map-set batch-operations {operator: tx-sender, batch-id: batch-id} {
+                operation-type: "batch-grant",
+                total-items: total-count,
+                completed-items: total-count,
+                started-at: stacks-block-height,
+                completed-at: stacks-block-height,
+                total-cost: u0,
+                status: "completed"
+            })
+            result
+        )
+    )
+)
+
+(define-private (batch-grant-helper (item {
+    token-id: uint,
+    accessor: principal,
+    permission-type: (string-ascii 32),
+    duration-blocks: uint
+}) (acc (response (list 10 bool) uint)))
+    (match acc
+        success-list
+            (match (grant-access
+                (get token-id item)
+                (get accessor item)
+                (get permission-type item)
+                (get duration-blocks item)
+            )
+                granted (ok (unwrap-panic (as-max-len? (append success-list granted) u10)))
+                err-val (err err-val)
+            )
+        err-val (err err-val)
+    )
+)
+
+(define-read-only (get-batch-operation (operator principal) (batch-id uint))
+    (map-get? batch-operations {operator: operator, batch-id: batch-id})
+)
+
+(define-read-only (get-next-batch-id)
+    (var-get next-batch-id)
+)
